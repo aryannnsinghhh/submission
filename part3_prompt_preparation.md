@@ -19,15 +19,13 @@ It addresses the problem faced in software development automation. Normally, tur
 
 ## 3.1.2 Pull Request Description
 
-Prior to this PR, there was no separate configuration route for embedding in `MetaGPT`'s `RAG` pipeline beyond the overall `llm` configuration block, which also controlled chat and completions. As a result, the embedding provider and the completion provider had to be the same, or have a matching API type, i.e. `OpenAI` or `Azure`. If you were running `Ollama` locally or using `Gemini`, you'd have to manually provide an embed model object at runtime, and there was no way to clearly state "use this particular provider for embeddings" without creating confusion in relation to your other `LLM` configuration settings.
+Prior to this PR, `MetaGPT`'s RAG pipeline had no separate configuration route for embeddings. Everything ran through the same `llm` config block that also handled chat and completions. This meant the embedding provider and the completion provider had to match, both had to be `OpenAI` or `Azure`. If you were using `Ollama` locally or `Gemini`, you had to manually pass an embed model object at runtime. There was no clean way to say "use this provider for embeddings" without conflicting with your existing LLM settings.
 
-This PR introduces a separate embedding section in the configuration. A new `EmbeddingConfig` class will hold all fields used to configure an embedding: API type, key, base URL, version, model name, and batch size. This configuration will be located next to the current `LLM` configuration in `config2.py`; they will not be integrated into one. The embedding factory, which is responsible for building the embedding object, will read from the embedding configuration first.
+This PR introduces a dedicated `EmbeddingConfig` class that holds all embedding-related fields: API type, key, base URL, version, model name, and batch size. This config sits alongside the existing `LLM` config in `config2.py` — completely separate, not merged in. The embedding factory now reads from `EmbeddingConfig` first. Four providers are supported out of the box:  OpenAI`, `Azure`, `Gemini`, and `Ollama`. Backward compatibility is maintained, if no embedding config is set and the main LLM is `OpenAI` or `Azure`, the old behaviour kicks in  automatically. Otherwise, a clear error is thrown explaining why the system cannot proceed.
 
-There are four `LlamaIndex` embedding providers supported directly by `LlamaIndex`: `OpenAI`, `Azure`, `Gemini`, and `Ollama`. `LlamaIndex` will allow you to use either provider's implementation of its corresponding embedding class. `LlamaIndex` maintains backward compatibility by defaulting to the old behaviour if no embedding config has been specified and the main `LLM` type is either `OpenAI` or `Azure`, therefore not disrupting existing setups. If neither of these two conditions is met, then `LlamaIndex` will return a detailed error message so that you know why the system cannot proceed.
+A fix was also made to how `FAISS` handles vector dimensions. The hardcoded value of `1536` only worked for OpenAI's `text-embedding-ada-002`. It was wrong for `Gemini` (`768`) and `Ollama` (`4096`). Now, if no dimension is provided, the system defaults to `0` and auto-fills the correct value based on the active embedding provider, preventing silent index failures at runtime.
 
-Also, a minor change was made to the way `FAISS` handles vector dimensions. The prior hardcoded value of `1536` was only correct for the `OpenAI` `text-embedding-ada-002` embedding model but incorrect for both `Gemini` (`768`) and `Ollama` (`4096`). This makes it so that if you use any `FAISS` embedding backend but do not provide a dimension value to the index create call, the system will default to using `0` as the dimension, and will automatically set the correct dimension based on the embedding provider specified in the configuration, as opposed to causing an index failure at runtime due to the dimensions used being inconsistent with what is expected by the `FAISS` library.
-
-Finally, the token counter has been updated to include the `gpt-4-turbo` embedding model so that cost estimation and enforcement of the context window will work properly for users of that model.
+Lastly, `gpt-4-turbo` was added to the token counter so cost estimation and context window enforcement work correctly for users of that model.
 
 ---
 
@@ -64,111 +62,63 @@ Suppose a user created and persisted a FAISS index while using OpenAI embeddings
 **Edge Case 3 — Ollama server not running when embedding is requested**
 Unlike OpenAI or Gemini, Ollama runs locally. If a user sets `api_type: ollama` but the Ollama server isn't up at the configured `base_url`, the failure will happen at query time, not at config load time — likely surfacing as a connection refused exception deep inside the LlamaIndex Ollama class. This should be caught and re-raised with a message that points back to the embedding config and suggests checking whether the Ollama service is actually running, rather than propagating a raw socket error.
 
-**Edge Case 4 — `embed_batch_size` set beyond the provider's limits**
-`EmbeddingConfig` includes an `embed_batch_size` field. Setting a very high batch size (say, 2048) with a provider that has strict rate limits or per-request size caps — Gemini in particular has input limits — will trigger API errors mid-pipeline. The embedding factory currently has no guard for this. At minimum, there should be sensible per-provider defaults for batch size, along with documentation on the limits for each provider.
-
 ---
 
 ## 3.1.5 Initial Prompt
 
 ```
-You are working on the MetaGPT open-source repository — a multi-agent LLM framework that
-simulates a software development team. Your task is to implement the changes described in
-PR #1172: making the RAG embedding configuration independent from the main LLM config,
-and adding gpt-4-turbo support to the token counter.
+You are working on MetaGPT, a multi-agent LLM framework that simulates a software development team. Your task is to implement PR #1172: making the RAG embedding configuration independent from the main LLM config, and adding `gpt-4-turbo` to the token counter.
 
 --- CONTEXT ---
 
-MetaGPT has a RAG module (under metagpt/rag/) that allows agents to retrieve relevant chunks
-from documents before generating answers. The retrieval step requires converting text into
-vector embeddings. Currently, the embedding provider is inferred from the main `llm` config
-block in config2.py — the same block that controls which model handles chat completions.
-This makes it impossible to cleanly use a different provider for embeddings versus completions
-(e.g., Ollama for embeddings + GPT-4 for answers), which is a common production setup.
+MetaGPT's RAG module (`metagpt/rag/`) lets agents retrieve relevant document chunks before generating answers. Currently, the embedding provider is pulled from the same `llm` block in `config2.py` that controls chat completions. This means you cannot cleanly use different providers for embeddings and completions, a common real-world need.
 
 --- WHAT YOU NEED TO IMPLEMENT ---
 
-1. CREATE metagpt/configs/embedding_config.py
-   Define two new objects:
-   - `EmbeddingType`: an enum with values for OPENAI, AZURE, GEMINI, OLLAMA
-   - `EmbeddingConfig`: a Pydantic model with fields: api_type (EmbeddingType, optional),
-     api_key (str, optional), base_url (str, optional), api_version (str, optional),
-     model (str, optional), embed_batch_size (int, optional with a sensible default)
+1. CREATE `metagpt/configs/embedding_config.py`
+   Define `EmbeddingType` (enum: OPENAI, AZURE, GEMINI, OLLAMA) and `EmbeddingConfig` (Pydantic model with optional fields: `api_type`, `api_key`, `base_url`, `api_version`, `model`, `embed_batch_size`)
 
-2. MODIFY metagpt/config2.py
-   Add `embedding: EmbeddingConfig = EmbeddingConfig()` as a top-level field so users can
-   declare their embedding provider separately from `llm`.
+2. MODIFY `metagpt/config2.py`
+   Add `embedding: EmbeddingConfig = EmbeddingConfig()` as a top-level field, separate from the existing `llm` block.
 
-3. REFACTOR metagpt/rag/factories/embedding.py
-   The embedding factory must now read from `config.embedding` first.
-   - If `embedding.api_type` is OPENAI → return LlamaIndex OpenAIEmbedding initialised
-     with fields from EmbeddingConfig
-   - If AZURE → return AzureOpenAIEmbedding with api_key, base_url, api_version from
-     EmbeddingConfig
-   - If GEMINI → return GeminiEmbedding
-   - If OLLAMA → return OllamaEmbedding using base_url from EmbeddingConfig
-   - If no embedding config is set AND llm config is OpenAI or Azure → fall back to
-     existing LLM-config-based behavior (backward compatibility)
-   - If no embedding config is set AND llm type is neither OpenAI nor Azure → raise a
-     descriptive ValueError telling the user to configure the `embedding` block in config2.yaml
+3. REFACTOR `metagpt/rag/factories/embedding.py`
+   Read from `config.embedding` first. Route each `api_type` to its correct LlamaIndex class. If no embedding config is set and `llm` is OpenAI or Azure, fall back to existing behavior. If `llm` is any other type, raise a descriptive `ValueError`.
 
-4. MODIFY metagpt/rag/schema.py
-   Change the FAISS `dimensions` default from 1536 to 0. Then auto-populate it based on
-   the configured embedding type:
-   - GEMINI → 768
-   - OLLAMA → 4096
-   - All others (including OpenAI/Azure fallback) → 1536
-   This logic should trigger when dimensions is 0 at index build time.
+4. MODIFY `metagpt/rag/schema.py`
+   Change FAISS `dimensions` default from `1536` to `0`. Auto-fill at index build time: GEMINI → 768, OLLAMA → 4096, all others → 1536.
 
-5. MODIFY setup.py
-   Add the following to the `rag` extras_require list:
-   - llama-index-embeddings-gemini
-   - llama-index-embeddings-ollama
+5. MODIFY `setup.py`
+   Add `llama-index-embeddings-gemini` and `llama-index-embeddings-ollama` to the `rag` extras list.
 
-6. MODIFY metagpt/utils/token_counter.py
-   Add gpt-4-turbo to the model pricing and token limit table. Use the correct values:
-   context window = 128,000 tokens, pricing consistent with OpenAI's published rates
-   for gpt-4-turbo at time of this PR.
+6. MODIFY `metagpt/utils/token_counter.py`
+   Add `gpt-4-turbo` with a 128,000 token context window and correct pricing.
 
-7. UPDATE config/config2.example.yaml
-   Add a commented-out `embedding:` section showing all configurable fields, with a note
-   explaining that if this section is omitted, the system falls back to OpenAI/Azure from
-   the main llm config.
+7. UPDATE `config/config2.example.yaml`
+   Add a commented-out `embedding:` section with all configurable fields and a note that omitting it falls back to the main `llm` config.
 
-8. UPDATE tests/metagpt/rag/factories/test_embedding.py
-   Add test cases for:
-   - EmbeddingConfig with each of the four api_types producing the correct LlamaIndex class
-   - Fallback path when embedding config is empty and llm is OpenAI
-   - Fallback path when embedding config is empty and llm is Azure
-   - Error path when embedding config is empty and llm is a non-OpenAI/Azure type
+8. UPDATE `tests/metagpt/rag/factories/test_embedding.py`
+   Add tests for all four provider branches, both fallback paths, and the error path when `llm` is an unsupported type.
 
---- ACCEPTANCE CRITERIA TO SATISFY ---
-
-- Setting api_type: gemini in the embedding config must use GeminiEmbedding and set FAISS
-  dimensions to 768 automatically
-- Setting api_type: ollama must use OllamaEmbedding and set FAISS dimensions to 4096
-- Omitting the embedding config with an OpenAI LLM must not break existing behavior
-- Omitting the embedding config with an unsupported LLM type must raise a clear ValueError
-- gpt-4-turbo in the token counter must not raise a KeyError and must return correct limits
+--- ACCEPTANCE CRITERIA ---
+- `api_type: openai` explicitly set must use `OpenAIEmbedding` — not fall back to the `llm` config
+- `api_type: gemini` must use `GeminiEmbedding` and auto-set FAISS dims to 768
+- `api_type: ollama` must use `OllamaEmbedding` and auto-set FAISS dims to 4096
+- `api_type: azure` must use `AzureOpenAIEmbedding` and read `api_key`, `base_url`, `api_version` from embedding config — not from `llm` config
+- No embedding config + OpenAI/Azure LLM must not break existing behaviour
+- No embedding config + unsupported LLM must raise a clear `ValueError`
+- `gpt-4-turbo` must return correct token limits without a `KeyError`
 - All existing RAG tests must continue to pass
+- `test_embedding.py` must cover all four provider branches, both fallback paths, and the error case for unsupported LLM type
 
---- EDGE CASES TO HANDLE ---
-
-- If EmbeddingConfig has api_type set but api_key is missing, raise a config validation
-  error at startup — do not let it fail silently at query time
-- If FAISS index is loaded from disk and the dimension of the loaded index does not match
-  the auto-filled dimension from the current embedding config, surface a clear error
-  message explaining the provider mismatch rather than an internal FAISS assertion
-- If api_type is OLLAMA and the connection to base_url fails, catch the connection error
-  and re-raise with a message pointing to the embedding config and suggesting the user
-  verify their Ollama service is running
+--- EDGE CASES ---
+- `api_type` set but `api_key` missing → raise a validation error at startup, not silently at query time
+- FAISS index loaded from disk with mismatched dimensions → raise a clear error explaining the provider mismatch before any query runs
+- OLLAMA `base_url` unreachable → catch and re-raise with a message pointing to the embedding config and asking the user to verify Ollama is running
+- `embed_batch_size` set beyond provider limits → do not crash mid-pipeline; use sensible per-provider defaults and document the limits clearly
 
 --- TESTING REQUIREMENTS ---
 
-Write unit tests for the embedding factory covering all four provider branches, both
-fallback paths, and the error path. Tests should mock the LlamaIndex embedding classes
-so they do not require live API credentials. Confirm that FAISSRetrieverConfig correctly
-auto-fills dimensions for Gemini and Ollama without user input.
+Mock all LlamaIndex classes — no live API credentials required. Cover all four provider branches, both fallback paths, and the error path. Confirm `FAISSRetrieverConfig` auto-fills dimensions for Gemini and Ollama correctly.
 ```
 
 ## Integrity Declaration
